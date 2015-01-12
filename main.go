@@ -17,10 +17,12 @@ package main
 
 import (
 	"compress/gzip"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -38,7 +40,15 @@ const URL = "http://git.gthomas.eu/gthomas/boltcrash/"
 func main() {
 	Log.SetHandler(log15.StderrHandler)
 	flagWorkdir := flag.String("workdir", os.Getenv("TMPDIR"), "work dir to save downloaded files to")
+	flagReplay := flag.Bool("replay", false, "download and replay the Camlistore session")
 	flag.Parse()
+
+	if !*flagReplay {
+		if err := direct(*flagWorkdir); err != nil {
+			os.Exit(2)
+		}
+		return
+	}
 
 	db, ops, err := downloadAndOpen(*flagWorkdir)
 	if err != nil {
@@ -54,6 +64,53 @@ func main() {
 }
 
 var bucketName = []byte("/")
+
+func direct(workdir string) error {
+	fn := filepath.Join(workdir, "direct.boltdb")
+	_ = os.Remove(fn) // fresh start
+	log.Printf("opening %q", fn)
+	db, err := bolt.Open(fn, 0644, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			Log.Error("close DB", "error", err)
+			if err != nil {
+				err = closeErr
+			}
+		}
+	}()
+	if err = db.Update(func(tx *bolt.Tx) error {
+		_, err = tx.CreateBucket(bucketName)
+		return err
+	}); err != nil {
+		return err
+	}
+
+	var key [8]byte
+	var value [1 << 20]byte // 1Mb
+	E := func(off, count int) error {
+		for i := off; i < off+count; i++ {
+			log.Printf("i=%d", i)
+			if err = db.Update(func(tx *bolt.Tx) error {
+				binary.BigEndian.PutUint64(key[:], uint64(i))
+				return tx.Bucket(bucketName).Put(key[:], value[:])
+			}); err != nil {
+				return err
+			}
+		}
+		return err
+	}
+
+	for i := 0; i < 257; i += 16 {
+		if err = E(i, 16); err != nil {
+			return err
+		}
+	}
+
+	return err
+}
 
 func execute(db *bolt.DB, ops <-chan operation) error {
 	var (
